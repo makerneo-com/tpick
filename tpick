@@ -18,6 +18,7 @@ Usage:
 """
 
 import glob
+import json
 import os
 import re
 import select
@@ -25,6 +26,7 @@ import shutil
 import subprocess
 import sys
 import termios
+import threading
 import time
 import tty
 from dataclasses import dataclass
@@ -35,6 +37,22 @@ ESC = b"\x1b"
 COLOR = sys.stdout.isatty()
 CLAUDE_PROJECTS = os.path.join(HOME, ".claude", "projects")
 CODEX_SESSIONS = os.path.join(HOME, ".codex", "sessions")
+
+# cache + async-refresh tuning -------------------------------------------------
+CACHE_VERSION = 1                        # bump to invalidate the on-disk cache
+POLL_TIMEOUT = 0.15                      # idle poll window so the bg refresh can redraw (seconds)
+ITEM_FIELDS = ("kind", "section", "name", "created",
+               "detail", "tool", "path", "attached", "source")
+
+
+def _cache_dir():
+    """Cache dir honors $XDG_CACHE_HOME, defaults to ~/.cache/tpick."""
+    base = os.environ.get("XDG_CACHE_HOME") or os.path.join(HOME, ".cache")
+    return os.path.join(base, "tpick")
+
+
+def _cache_path():
+    return os.path.join(_cache_dir(), "dirs.json")
 
 
 # --------------------------------------------------------------------------- data
@@ -169,6 +187,53 @@ def collect_zellij():
     return items
 
 
+# --------------------------------------------------------------------------- cache
+#
+# Two-tier cache for the DIRECTORIES source:
+#   dirs   = last collect_dirs() result (Item fields flattened) -> instant first frame
+#   files  = per-jsonl {size, mtime, cwds} index -> skip re-reading unchanged Codex files
+#
+# Rules:
+#   - Only the background daemon thread writes the cache; the main thread only reads.
+#   - Cache is advisory: any read/write error degrades gracefully to a full scan.
+#   - Version mismatch discards the whole file (no partial migration).
+
+
+def load_cache():
+    """Return (cached_dirs, files_index). Empty on any error or version mismatch."""
+    try:
+        with open(_cache_path(), "r") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        return [], {}
+    if data.get("version") != CACHE_VERSION:
+        return [], {}
+    dirs = []
+    for d in data.get("dirs", []):
+        try:
+            dirs.append(Item(**{k: d[k] for k in ITEM_FIELDS}))
+        except (KeyError, TypeError):
+            continue          # corrupt/incomplete item -> skip, never crash
+    return dirs, data.get("files", {})
+
+
+def save_cache(dirs, files_index):
+    """Atomic write via .tmp + os.replace. Swallow all errors (cache is advisory)."""
+    try:
+        os.makedirs(_cache_dir(), exist_ok=True)
+        payload = {
+            "version": CACHE_VERSION,
+            "dirs": [{k: getattr(d, k) for k in ITEM_FIELDS} for d in dirs],
+            "files": files_index,
+        }
+        tmp = _cache_path() + ".tmp"
+        with open(tmp, "w") as fh:
+            json.dump(payload, fh, allow_nan=False)
+        os.replace(tmp, _cache_path())
+    except (OSError, ValueError):
+        pass
+
+
 # --------------------------------------------------------------------------- collectors: dirs
 
 def _decode_claude_project(name):
@@ -178,27 +243,75 @@ def _decode_claude_project(name):
     return "/" + name[1:].replace("-", "/")
 
 
-def _codex_cwd_entries():
-    """Yield (cwd, file_mtime) from Codex session rollout files."""
+def _extract_cwds(data):
+    """Deduped cwd values extracted from a Codex rollout file body (bytes)."""
+    seen = set()
+    cwds = []
+    for raw in re.findall(rb'"cwd"\s*:\s*"([^"]+)"', data):
+        cwd = raw.decode("utf-8", "replace").replace("\\/", "/")
+        if cwd not in seen:
+            seen.add(cwd)
+            cwds.append(cwd)
+    return cwds
+
+
+def _codex_cwd_entries(files_index):
+    """Yield (cwd, file_mtime) from Codex session rollout files.
+
+    ``files_index`` is mutated in place: each jsonl is recorded with its
+    (size, mtime, deduped cwds). On a later call a file whose size+mtime are
+    unchanged is skipped (its cached cwds are replayed), so the bulk content
+    read only happens for files that actually changed.
+
+    Only one thread (the daemon) touches ``files_index``; the main thread never
+    does, so no lock is needed here.
+    """
     pattern = os.path.join(CODEX_SESSIONS, "**", "*.jsonl")
-    for path in glob.glob(pattern, recursive=True):
+    paths = glob.glob(pattern, recursive=True)
+    for path in paths:
         try:
-            mtime = os.path.getmtime(path)
-            with open(path, "r", errors="replace") as fh:
-                text = fh.read()
+            st = os.stat(path)
+        except OSError:
+            files_index.pop(path, None)        # deleted since last scan
+            continue
+        cached = files_index.get(path)
+        if cached and cached.get("size") == st.st_size \
+                and cached.get("mtime") == st.st_mtime:
+            for cwd in cached["cwds"]:         # unchanged on disk -> reuse
+                yield cwd, st.st_mtime
+            continue
+        try:
+            with open(path, "rb") as fh:
+                data = fh.read()
         except OSError:
             continue
-        for cwd in re.findall(r'"cwd"\s*:\s*"([^"]+)"', text):
-            cwd = cwd.replace("\\/", "/")
-            yield cwd, mtime
+        cwds = _extract_cwds(data)
+        # read as bytes so len() is byte-accurate against st_size; decoded char
+        # counts would never match for non-ASCII files. append-only files may
+        # grow mid-read -> if so, don't cache so the next run re-reads (a
+        # truncated tail cwd could otherwise be lost forever).
+        if len(data) == st.st_size:
+            files_index[path] = {"size": st.st_size, "mtime": st.st_mtime, "cwds": cwds}
+        for cwd in cwds:
+            yield cwd, st.st_mtime
+    # drop index entries for jsonl files that no longer exist on disk
+    live = set(paths)
+    for path in [p for p in files_index if p not in live]:
+        del files_index[path]
 
 
-def collect_dirs():
+def collect_dirs(files_index=None):
     """Dirs recently used by Claude Code / Codex, newest first.
 
     Each dir maps to its most recent activity mtime. Dead/old paths that no
     longer exist on disk are filtered out automatically.
+
+    ``files_index``: when given (a mutable dict), Codex jsonl files are scanned
+    incrementally and the index is updated in place; pass None for a one-off
+    full scan with no caching (used by the non-interactive ``-l`` path).
     """
+    if files_index is None:
+        files_index = {}
     latest = {}   # path -> mtime
     sources = {}  # path -> set of provenance
 
@@ -215,7 +328,7 @@ def collect_dirs():
                 latest[decoded] = max(latest.get(decoded, 0), mtime)
                 sources.setdefault(decoded, set()).add("claude")
 
-    for cwd, mtime in _codex_cwd_entries():
+    for cwd, mtime in _codex_cwd_entries(files_index):
         if os.path.isdir(cwd):
             latest[cwd] = max(latest.get(cwd, 0), mtime)
             sources.setdefault(cwd, set()).add("codex")
@@ -307,8 +420,18 @@ def section_title(title, count):
 
 # --------------------------------------------------------------------------- input
 
-def _read_token(fd):
-    """Read one key or UTF-8 character from a raw tty as bytes (None on EOF)."""
+def _read_token(fd, poll_timeout=None):
+    """Read one key or UTF-8 character from a raw tty as bytes.
+
+    Returns b"" when ``poll_timeout`` elapses with no input (idle sentinel --
+    lets the search loop wake up to apply a background refresh) and None on EOF.
+    Multi-byte continuation reads keep their own short timeouts so a partial
+    key sequence times out instead of blocking.
+    """
+    if poll_timeout is not None:
+        r, _, _ = select.select([fd], [], [], poll_timeout)
+        if not r:
+            return b""            # idle: no key within the poll window
     b = os.read(fd, 1)
     if not b:
         return None
@@ -331,11 +454,17 @@ def _read_token(fd):
     return b
 
 
-def read_action(fd):
-    """Normalize a raw keypress into an action string (or None to ignore)."""
-    b = _read_token(fd)
+def read_action(fd, poll_timeout=None):
+    """Normalize a raw keypress into an action string.
+
+    Returns "idle" (no key within poll_timeout), "abort" (EOF / Ctrl-C / Ctrl-D),
+    or one of the action strings / ("char", c) tuples. None means "ignore".
+    """
+    b = _read_token(fd, poll_timeout)
     if b is None:
         return "abort"
+    if b == b"":
+        return "idle"
     if b == ESC:
         rest = b""
         for _ in range(2):
@@ -371,6 +500,33 @@ def read_action(fd):
 
 
 # --------------------------------------------------------------------------- search
+
+class RefreshSlot:
+    """Single-slot handoff from the background daemon to the search loop.
+
+    The daemon puts a fresh items list; the main loop takes it (None if empty).
+    A lock guards the list-reference swap -- this is the only cross-thread state
+    shared with the daemon; the per-file ``files_index`` stays daemon-private.
+    """
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._items = None
+
+    def put(self, items):
+        with self._lock:
+            self._items = items
+
+    def take(self):
+        with self._lock:
+            items, self._items = self._items, None
+            return items
+
+
+def _item_key(item):
+    """Stable identity for re-aligning the cursor after a background refresh."""
+    return (item.kind, item.path or item.name)
+
 
 def matches(query, item):
     if not query:
@@ -408,24 +564,56 @@ def render_search(filtered, query, cursor, top, rows, cols):
     return top
 
 
-def search_loop(items):
+def search_loop(items, refresher=None):
+    """Interactive fuzzy picker.
+
+    ``refresher`` is an optional zero-arg callable returning a fresh items list
+    or None; it is polled on each idle tick so a background scan can refresh the
+    list without blocking input. A dirty flag avoids redrawing on every idle
+    tick (which would spin and flicker), and the cursor is re-aligned by stable
+    item key across a refresh so the selection does not jump.
+    """
     fd = sys.stdin.fileno()
     old = termios.tcgetattr(fd)
     query, cursor, top = "", 0, 0
+    align_key = None   # snap cursor to this key on the next filter pass
+    dirty = True
     try:
         tty.setraw(fd)
         while True:
             filtered = [it for it in items if matches(query, it)]
-            cursor = min(max(cursor, 0), len(filtered) - 1) if filtered else 0
-            cols, rows = shutil.get_terminal_size((80, 24))
-            top = render_search(filtered, query, cursor, top, rows, cols)
-            action = read_action(fd)
+            if align_key is not None:
+                # background refresh landed: keep the same item selected if possible
+                for i, it in enumerate(filtered):
+                    if _item_key(it) == align_key:
+                        cursor = i
+                        break
+                else:
+                    cursor = min(max(cursor, 0), len(filtered) - 1) if filtered else 0
+                align_key = None
+            else:
+                cursor = min(max(cursor, 0), len(filtered) - 1) if filtered else 0
+            if dirty:
+                cols, rows = shutil.get_terminal_size((80, 24))
+                top = render_search(filtered, query, cursor, top, rows, cols)
+                dirty = False
+            action = read_action(fd, POLL_TIMEOUT)
+            if action == "idle":
+                if refresher is not None:
+                    new_items = refresher()
+                    if new_items is not None:
+                        if filtered:
+                            align_key = _item_key(filtered[cursor])
+                        items = new_items
+                        dirty = True
+                continue
             if action == "abort":
                 break
             if action == "esc":
                 # first Esc clears the query; a second Esc (empty query) quits
                 if query:
                     query = ""
+                    dirty = True
                     continue
                 break
             if action == "enter" and filtered:
@@ -436,15 +624,22 @@ def search_loop(items):
                 if attach(filtered[cursor]):
                     return  # process replaced; normally unreachable
                 tty.setraw(fd)
+                dirty = True
             elif action == "up":
                 cursor = max(0, cursor - 1)
+                dirty = True
             elif action == "down":
                 cursor = min(len(filtered) - 1, cursor + 1) if filtered else 0
+                dirty = True
             elif action == "backspace":
                 query = query[:-1]
+                dirty = True
             elif isinstance(action, tuple) and action[0] == "char":
                 query += action[1]
-            # None / redraw / left / right: just redraw on the next loop
+                dirty = True
+            elif action == "redraw":
+                dirty = True
+            # None / left / right: nothing changed, no redraw needed
     finally:
         termios.tcsetattr(fd, termios.TCSADRAIN, old)
         sys.stdout.write("\r\n")
@@ -512,17 +707,49 @@ def collect_all():
 
 def main():
     args = sys.argv[1:]
-    items = collect_all()
-
     non_interactive = (not sys.stdin.isatty()) or ("-l" in args or "--list" in args)
-    if non_interactive or not items:
+
+    # Non-interactive path: always a fresh full scan. Never cached, never async --
+    # scripts and pipes need the truth, not a possibly-stale cache.
+    if non_interactive:
+        items = collect_all()
         if not items:
             print("No sessions and no Claude Code / Codex project dirs found.")
         else:
             print_list(items)
         return 0
 
-    search_loop(items)
+    # Interactive path: the first frame renders instantly from the on-disk cache
+    # (or a one-off blocking scan when there is no cache yet); a background daemon
+    # then re-scans incrementally, writes the cache, and refreshes the list.
+    cached_dirs, files_index = load_cache()
+    sessions = collect_tmux() + collect_zellij()
+    sessions.sort(key=lambda it: (-it.created, it.tool, it.name))
+
+    if cached_dirs:
+        items = sessions + cached_dirs
+    else:
+        # first run / cache wiped: pay the scan once so the first frame shows dirs
+        dirs = collect_dirs(files_index)
+        save_cache(dirs, files_index)
+        items = sessions + dirs
+
+    slot = RefreshSlot()
+
+    def daemon_target():
+        # Collectors must not touch stdout/stderr (a raw tty is active); swallow
+        # any error so the daemon can never crash the interactive UI. The main
+        # thread stops touching ``files_index`` after this point, and ``sessions``
+        # is only read here, so no lock is needed around either.
+        try:
+            new_dirs = collect_dirs(files_index)
+            save_cache(new_dirs, files_index)
+            slot.put(sessions + new_dirs)
+        except BaseException:
+            pass
+
+    threading.Thread(target=daemon_target, daemon=True).start()
+    search_loop(items, refresher=slot.take)
     return 0
 
 
