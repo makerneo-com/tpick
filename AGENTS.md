@@ -48,17 +48,20 @@
 
 ## 架构 & 关键技术点（改代码前必读）
 
-数据流：`collect_all()` → `search_loop()` → `attach()`。
+数据流：
+- 非交互（`-l` / stdin 非 tty）：`collect_all()` → `print_list()`，每次全量实扫，**不读缓存、不起后台线程**（脚本和管道要真值，不能拿可能过期的缓存）。
+- 交互：`load_cache()` 取缓存首帧秒开 → `search_loop()` 渲染 → 后台 daemon 增量 `collect_dirs()` 重算后经 `RefreshSlot` 刷新列表 → `attach()`。
 
 **几个非显然、容易踩坑的点：**
 
 - **zellij 会话工作目录**：zellij 不在 `list-sessions` 暴露 cwd。每个会话是一个 `zellij --server <socket>` 进程，socket 路径末段即会话名；用 `lsof -a -p <pid> -d cwd -Fn` 读该进程 cwd = 会话启动目录。改这里时保持「socket 末段 ↔ 会话名」的映射。
 - **Claude Code 项目路径解码**：`~/.claude/projects/` 的子目录名是路径编码（`-Users-foo-bar`），解码规则是首字符 `-` 当 `/`、其余 `-`→`/`。路径段本身含 `-` 会产生歧义，所以**解码后必须 `os.path.isdir()` 验证**，不存在的丢弃。
-- **Codex 目录来源**：扫 `~/.codex/sessions/**/*.jsonl` 里的 `"cwd"` 字段，按文件 mtime 取最近一次。
+- **Codex 目录来源**：扫 `~/.codex/sessions/**/*.jsonl` 里的 `"cwd"` 字段，按文件 mtime 取最近一次。**必须二进制读**（`open(path,"rb")` + bytes 正则 `rb'"cwd"\s*:\s*"([^"]+)"'`）——text 模式 `errors="replace"` 解码后字符数 ≠ 字节数，会让读后校验 `len(data)==st.st_size` 永远失败、文件级缓存永不命中。
 - **raw tty 按键**：交互用 `tty.setraw`。`Enter` 是 `\r`（**不是** `\n`——`\n` == `\x0a` == Ctrl-J，被映射成 `down`）。`ESC` 常量必须是 **bytes** `b"\x1b"`（`os.read` 返回 bytes，和 str 比较会静默失败，导致 esc / 方向键全部失效）。方向键是 `\x1b[A/B/C/D` 多字节序列，读完 `\x1b` 后用 `select` 非阻塞读后续字节。
 - **颜色与对齐**：ANSI 颜色码必须包在**已经 pad 到目标宽度的可见字符串**外面（如 `paint(f"{kind:<7}", code)`）；否则 `<7` 会按"可见字符 + 转义字符数"计算，列对齐会错乱。
 - **attach 用 `os.execvp`**：选中目录时先 `os.chdir(path)` 再 execvp `zellij --session <basename>`，会话继承该 cwd（zellij 没有 `--cwd` flag）。execvp 成功不返回；末尾的 `return True` 仅为测试与可读性保留。
 - **双 Esc 行为**：第一个 Esc 清空 query 回全列表；query 已空时第二个 Esc 才退出（Ctrl-C / Ctrl-D 仍立即退出）。
+- **缓存与异步刷新**（仅交互路径）：`$XDG_CACHE_HOME/tpick/dirs.json`（默认 `~/.cache/tpick/dirs.json`）存两级缓存——`dirs`（上次 `collect_dirs` 结果拍平，首帧秒开）+ `files`（每个 jsonl 的 `{size,mtime,cwds}`，未变则跳过整文件读取，665 文件 454MB 扫描 ~700ms→~11ms）。首帧用缓存渲染，daemon 线程增量重算后经 `RefreshSlot` 刷新列表。几条纪律：① **只有 daemon 写缓存**，主线程只读；`files_index` 仅 daemon 读写无需锁，`RefreshSlot`（跨线程 list 引用替换）必须 `Lock`。② daemon 入口 `try/except BaseException` 吞异常——raw tty 下任何 `print`/栈回溯都会污染屏幕，collectors 禁止碰 stdout/stderr。③ **`_read_token` 首字节读必须带 `poll_timeout` 超时**返回 idle 哨兵（`b""`），否则无按键时 `search_loop` 阻塞在 `os.read`、后台刷新无法触发重绘；但 ESC 续读与多字节 UTF-8 那几次 `select` **保持固定 0.02/0.05 不变**（否则破坏 Esc/方向键/UTF-8 语义）。④ `search_loop` 用 `dirty` 标志避免 idle tick 空转重绘闪烁；后台刷新后用 `(kind, path or name)` 作 key 对齐 cursor，防止选中项跳走。⑤ append-only 的 jsonl 可能边写边读，读后用 `len(data)==st.st_size` 校验，不等就不缓存、下轮重读，避免尾部 cwd 永久丢失。
 
 ## 重要文件
 

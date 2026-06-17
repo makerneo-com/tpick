@@ -67,6 +67,7 @@ tpick 的列表分两个区：
 - **Claude Code**：扫描 `~/.claude/projects/`，目录名即项目路径（`-Users-foo-bar` → `/Users/foo/bar`）。
 - **Codex**：扫描 `~/.codex/sessions/**/*.jsonl` 里的 `cwd` 字段。
 - 已不存在（被删 / 路径迁移）的目录会被自动过滤；每条标注来源 `[claude]` / `[codex]` / `[claude+codex]`，按最近使用排序。
+- **本地缓存加速**：目录列表缓存在 `~/.cache/tpick/dirs.json`，交互启动时先用缓存秒开首帧，后台再增量重扫刷新（未变化的 Codex 文件直接跳过，几百 MB 的扫描从秒级降到毫秒级）。数据始终以磁盘为准，缓存只用于加速；`tpick -l`（非交互）永远全量实扫、不读缓存。
 
 ## 平台
 
