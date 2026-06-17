@@ -1,0 +1,533 @@
+#!/usr/bin/env python3
+"""tpick -- fuzzy-pick a tmux/zellij session or project dir, then jump into it.
+
+Default mode is a live search:
+    type        filter by name / working directory
+    Up / Down   (or Ctrl-J / Ctrl-K) move the selection
+    Enter       attach (session) or start `zellij --session <basename>` in that dir
+    Esc         clear the query; press again (when empty) to quit
+    Ctrl-C / Ctrl-D   quit immediately
+
+Sources:
+    SESSIONS     running tmux + zellij sessions
+    DIRECTORIES  dirs recently used by Claude Code / Codex
+
+Usage:
+    tpick       interactive search picker
+    tpick -l    non-interactive list (also auto when stdin is not a tty)
+"""
+
+import glob
+import os
+import re
+import select
+import shutil
+import subprocess
+import sys
+import termios
+import time
+import tty
+from dataclasses import dataclass
+
+HOME = os.path.expanduser("~")
+KEYS = list("asdfghjkl;qwertyuiopzxcvbnm,./1234567890")  # only used by `ts -l`
+ESC = b"\x1b"
+COLOR = sys.stdout.isatty()
+CLAUDE_PROJECTS = os.path.join(HOME, ".claude", "projects")
+CODEX_SESSIONS = os.path.join(HOME, ".codex", "sessions")
+
+
+# --------------------------------------------------------------------------- data
+
+@dataclass
+class Item:
+    kind: str            # "session" | "dir"
+    section: str         # "SESSIONS" | "DIRECTORIES"
+    name: str            # session name / dir basename
+    created: float       # epoch seconds, used for sorting within a section
+    detail: str = ""     # workdir / full dir path
+    tool: str = ""       # tmux | zellij (sessions only)
+    path: str = ""       # absolute dir path (dirs only)
+    attached: bool = False
+    source: str = ""     # provenance for dirs: claude | codex | claude+codex
+
+
+# --------------------------------------------------------------------------- shell helpers
+
+def run(argv, timeout=8):
+    """Run a command, return stdout (empty string on any failure)."""
+    try:
+        proc = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
+        return proc.stdout
+    except Exception:
+        return ""
+
+
+def lsof_cwd(pid):
+    """Return the cwd of a process via lsof, or empty string."""
+    out = run(["lsof", "-a", "-p", str(pid), "-d", "cwd", "-Fn"])
+    for line in out.splitlines():
+        if line.startswith("n"):
+            return line[1:]
+    return ""
+
+
+# --------------------------------------------------------------------------- collectors: sessions
+
+def collect_tmux():
+    """tmux sessions: name, created (epoch), active-pane cwd, attached flag."""
+    if not shutil.which("tmux"):
+        return []
+    sep = "\x1f"  # unit separator avoids clashes with weird names / paths
+    fmt = sep.join([
+        "#{session_name}",
+        "#{session_created}",
+        "#{pane_current_path}",
+        "#{session_attached}",
+    ])
+    out = run(["tmux", "list-sessions", "-F", fmt])
+    items = []
+    for line in out.splitlines():
+        parts = line.split(sep)
+        if len(parts) < 4:
+            continue
+        name, created, path, attached = parts
+        try:
+            created = float(created)
+        except ValueError:
+            continue
+        items.append(Item("session", "SESSIONS", name, created,
+                          detail=path, tool="tmux", attached=attached == "1"))
+    return items
+
+
+def _parse_relative_seconds(text):
+    """Turn '12days 18h 32m 30s' into seconds."""
+    total = 0
+    for num, unit in re.findall(
+        r"(\d+)\s*(days?|hours?|hrs?|h|minutes?|mins?|m|seconds?|secs?|s)", text
+    ):
+        u = unit.lower()
+        if u.startswith("d"):
+            total += int(num) * 86400
+        elif u.startswith("h"):
+            total += int(num) * 3600
+        elif u.startswith("m"):
+            total += int(num) * 60
+        elif u.startswith("s"):
+            total += int(num)
+    return total
+
+
+def _zellij_server_cwd_map():
+    """Map zellij session name -> server process cwd.
+
+    Each session is a 'zellij --server <socket>' process; the socket's last
+    path segment is the session name.
+    """
+    out = run(["ps", "-axo", "pid=,command="])
+    pid_by_name = {}
+    for line in out.splitlines():
+        parts = line.strip().split(None, 1)
+        if len(parts) < 2:
+            continue
+        pid, cmd = parts
+        if "--server" not in cmd:
+            continue
+        rest = cmd.split("--server", 1)[1].strip().split()
+        if not rest:
+            continue
+        name = rest[0].rstrip("/").split("/")[-1]
+        if name:
+            pid_by_name[name] = pid
+    cwd_map = {}
+    for name, pid in pid_by_name.items():
+        path = lsof_cwd(pid)
+        if path:
+            cwd_map[name] = path
+    return cwd_map
+
+
+def collect_zellij():
+    """zellij sessions: name + created (from relative time) + server cwd."""
+    if not shutil.which("zellij"):
+        return []
+    out = run(["zellij", "list-sessions", "-n"])
+    if not out:
+        return []
+    cwd_map = _zellij_server_cwd_map()
+    now = time.time()
+    items = []
+    for line in out.splitlines():
+        m = re.search(r"^(.+?)\s*\[\s*Created\s+(.+?)\s+ago\s*\]", line)
+        if not m:
+            continue
+        name = m.group(1).strip()
+        delta = _parse_relative_seconds(m.group(2))
+        items.append(Item("session", "SESSIONS", name, now - delta,
+                          detail=cwd_map.get(name, ""), tool="zellij"))
+    return items
+
+
+# --------------------------------------------------------------------------- collectors: dirs
+
+def _decode_claude_project(name):
+    """'-Users-neo-makerneo-dotfiles' -> '/Users/neo/makerneo/dotfiles'."""
+    if not name.startswith("-"):
+        return None
+    return "/" + name[1:].replace("-", "/")
+
+
+def _codex_cwd_entries():
+    """Yield (cwd, file_mtime) from Codex session rollout files."""
+    pattern = os.path.join(CODEX_SESSIONS, "**", "*.jsonl")
+    for path in glob.glob(pattern, recursive=True):
+        try:
+            mtime = os.path.getmtime(path)
+            with open(path, "r", errors="replace") as fh:
+                text = fh.read()
+        except OSError:
+            continue
+        for cwd in re.findall(r'"cwd"\s*:\s*"([^"]+)"', text):
+            cwd = cwd.replace("\\/", "/")
+            yield cwd, mtime
+
+
+def collect_dirs():
+    """Dirs recently used by Claude Code / Codex, newest first.
+
+    Each dir maps to its most recent activity mtime. Dead/old paths that no
+    longer exist on disk are filtered out automatically.
+    """
+    latest = {}   # path -> mtime
+    sources = {}  # path -> set of provenance
+
+    if os.path.isdir(CLAUDE_PROJECTS):
+        for entry in os.listdir(CLAUDE_PROJECTS):
+            decoded = _decode_claude_project(entry)
+            if not decoded:
+                continue
+            try:
+                mtime = os.path.getmtime(os.path.join(CLAUDE_PROJECTS, entry))
+            except OSError:
+                continue
+            if os.path.isdir(decoded):
+                latest[decoded] = max(latest.get(decoded, 0), mtime)
+                sources.setdefault(decoded, set()).add("claude")
+
+    for cwd, mtime in _codex_cwd_entries():
+        if os.path.isdir(cwd):
+            latest[cwd] = max(latest.get(cwd, 0), mtime)
+            sources.setdefault(cwd, set()).add("codex")
+
+    items = []
+    for path, mtime in latest.items():
+        if path == HOME:  # bare home is not a useful project dir
+            continue
+        base = os.path.basename(path.rstrip("/")) or path
+        src = sources.get(path, set())
+        label = "+".join(sorted(src)) if src else ""
+        items.append(Item("dir", "DIRECTORIES", base, mtime,
+                          detail=path, path=path, source=label))
+    items.sort(key=lambda it: -it.created)
+    return items
+
+
+# --------------------------------------------------------------------------- formatting
+
+def paint(text, code):
+    if not COLOR:
+        return text
+    return f"\033[{code}m{text}\033[0m"
+
+
+def humanize_age(ts):
+    d = max(0, int(time.time() - ts))
+    if d < 60:
+        return f"{d}s ago"
+    if d < 3600:
+        return f"{d // 60}m ago"
+    if d < 86400:
+        return f"{d // 3600}h ago"
+    return f"{d // 86400}d ago"
+
+
+def shorten_home(path):
+    if not path:
+        return "-"
+    if path == HOME:
+        return "~"
+    if path.startswith(HOME + "/"):
+        return "~" + path[len(HOME):]
+    return path
+
+
+def truncate(text, width):
+    if width <= 0:
+        return ""
+    if len(text) <= width:
+        return text
+    if width == 1:
+        return "…"
+    return "…" + text[-(width - 1):]
+
+
+def kind_label(item):
+    if item.kind == "dir":
+        return "dir", "35"  # magenta
+    return item.tool, ("32" if item.tool == "tmux" else "36")
+
+
+def render_row(item, selected, detail_width):
+    """One row; colors wrap already-padded visible strings so alignment holds."""
+    kind, code = kind_label(item)
+    kind_col = paint(f"{kind:<7}", code)
+    name = truncate(item.name, 26).ljust(26)
+    age = humanize_age(item.created).ljust(9)
+    detail = truncate(shorten_home(item.detail), detail_width)
+    suffix = ""
+    if item.kind == "dir" and item.source:
+        suffix = paint(f"  [{item.source}]", "2")
+    elif item.attached:
+        suffix = paint("  ●", "32")
+    body = f" {kind_col}{name}{age}{detail}{suffix}"
+    if selected:
+        return paint(body, "7") if COLOR else (">" + body[1:])
+    return body
+
+
+def header_line(detail_width):
+    h = f"  {'KIND':<7}{'NAME':<26}{'CREATED':<9}" + truncate("DETAIL", detail_width)
+    return paint(h, "2")
+
+
+def section_title(title, count):
+    return paint(f"──── {title} ({count}) ────", "1;4")
+
+
+# --------------------------------------------------------------------------- input
+
+def _read_token(fd):
+    """Read one key or UTF-8 character from a raw tty as bytes (None on EOF)."""
+    b = os.read(fd, 1)
+    if not b:
+        return None
+    first = b[0]
+    if first < 0x80:
+        return b
+    if first >> 5 == 0b110:
+        n = 2
+    elif first >> 4 == 0b1110:
+        n = 3
+    elif first >> 3 == 0b11110:
+        n = 4
+    else:
+        n = 1
+    for _ in range(n - 1):
+        r, _, _ = select.select([fd], [], [], 0.05)
+        if not r:
+            break
+        b += os.read(fd, 1)
+    return b
+
+
+def read_action(fd):
+    """Normalize a raw keypress into an action string (or None to ignore)."""
+    b = _read_token(fd)
+    if b is None:
+        return "abort"
+    if b == ESC:
+        rest = b""
+        for _ in range(2):
+            r, _, _ = select.select([fd], [], [], 0.02)
+            if not r:
+                break
+            rest += os.read(fd, 1)
+        seq = b"\x1b" + rest
+        table = {b"\x1b[A": "up", b"\x1b[B": "down",
+                 b"\x1b[C": "right", b"\x1b[D": "left"}
+        if seq in table:
+            return table[seq]
+        return "esc" if rest == b"" else None
+    if b == b"\r":
+        return "enter"
+    if b in (b"\x7f", b"\x08"):
+        return "backspace"
+    if b in (b"\x03", b"\x04"):
+        return "abort"
+    if b == b"\x0a":
+        return "down"   # Ctrl-J
+    if b == b"\x0b":
+        return "up"     # Ctrl-K
+    if b == b"\x0c":
+        return "redraw"  # Ctrl-L
+    try:
+        ch = b.decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+    if ch.isprintable():
+        return ("char", ch)
+    return None
+
+
+# --------------------------------------------------------------------------- search
+
+def matches(query, item):
+    if not query:
+        return True
+    q = query.lower()
+    return q in item.name.lower() or q in item.detail.lower()
+
+
+def render_search(filtered, query, cursor, top, rows, cols):
+    """Draw the full-screen search UI; return the (possibly adjusted) top."""
+    list_h = max(1, rows - 2)  # one query line + one hint line
+    if filtered:
+        if cursor < top:
+            top = cursor
+        elif cursor >= top + list_h:
+            top = cursor - list_h + 1
+        top = max(0, min(top, max(0, len(filtered) - list_h)))
+    else:
+        top = 0
+    detail_width = max(14, cols - 1 - 7 - 26 - 9 - 12)
+    visible = filtered[top:top + list_h]
+
+    cursor_block = paint(" ", "7") if COLOR else ""
+    lines = [paint(" ❯ ", "1;36") + query + cursor_block]
+    if not filtered:
+        lines.append(paint(f'  no matches for "{query}"', "2"))
+    for i, it in enumerate(visible):
+        lines.append(render_row(it, (top + i) == cursor, detail_width))
+    while len(lines) < 1 + list_h:
+        lines.append("")
+    lines.append(paint("  type to filter · ↑↓ or Ctrl-J/K move · Enter open · Esc clears/quit", "2"))
+
+    sys.stdout.write("\x1b[H\x1b[2J" + "\r\n".join(lines))
+    sys.stdout.flush()
+    return top
+
+
+def search_loop(items):
+    fd = sys.stdin.fileno()
+    old = termios.tcgetattr(fd)
+    query, cursor, top = "", 0, 0
+    try:
+        tty.setraw(fd)
+        while True:
+            filtered = [it for it in items if matches(query, it)]
+            cursor = min(max(cursor, 0), len(filtered) - 1) if filtered else 0
+            cols, rows = shutil.get_terminal_size((80, 24))
+            top = render_search(filtered, query, cursor, top, rows, cols)
+            action = read_action(fd)
+            if action == "abort":
+                break
+            if action == "esc":
+                # first Esc clears the query; a second Esc (empty query) quits
+                if query:
+                    query = ""
+                    continue
+                break
+            if action == "enter" and filtered:
+                # restore cooked tty so the multiplexer owns a normal terminal
+                termios.tcsetattr(fd, termios.TCSADRAIN, old)
+                sys.stdout.write("\r\n")
+                sys.stdout.flush()
+                if attach(filtered[cursor]):
+                    return  # process replaced; normally unreachable
+                tty.setraw(fd)
+            elif action == "up":
+                cursor = max(0, cursor - 1)
+            elif action == "down":
+                cursor = min(len(filtered) - 1, cursor + 1) if filtered else 0
+            elif action == "backspace":
+                query = query[:-1]
+            elif isinstance(action, tuple) and action[0] == "char":
+                query += action[1]
+            # None / redraw / left / right: just redraw on the next loop
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+        sys.stdout.write("\r\n")
+        sys.stdout.flush()
+
+
+# --------------------------------------------------------------------------- attach / launch
+
+def attach(item):
+    """Replace this process with the target multiplexer (execvp)."""
+    if item.kind == "dir":
+        name = os.path.basename(item.path.rstrip("/")) or "session"
+        if not shutil.which("zellij"):
+            print(paint("✗ zellij not found in PATH", "31"))
+            return False
+        try:
+            os.chdir(item.path)  # zellij inherits the new cwd as its start dir
+        except OSError as e:
+            print(paint(f"✗ cannot cd to {item.path}: {e}", "31"))
+            return False
+        argv = ["zellij", "--session", name]
+    elif item.tool == "tmux":
+        argv = ["tmux", "attach", "-t", item.name]
+    else:
+        argv = ["zellij", "attach", item.name]
+
+    if not shutil.which(argv[0]):
+        print(paint(f"✗ {argv[0]} not found in PATH", "31"))
+        return False
+    sys.stdout.flush()
+    try:
+        os.execvp(argv[0], argv)  # does not return on success
+    except Exception as e:
+        print(paint(f"✗ launch failed: {e}", "31"))
+        return False
+    return True  # unreachable in practice; kept for clarity and tests
+
+
+# --------------------------------------------------------------------------- render: non-interactive
+
+def print_list(items):
+    """Non-interactive dump for pipes / `ts -l`."""
+    cols, _ = shutil.get_terminal_size((80, 24))
+    detail_width = max(14, cols - 2 - 7 - 26 - 9 - 12)
+    prev = None
+    for i, item in enumerate(items):
+        if item.section != prev:
+            same = [x for x in items if x.section == item.section]
+            print(section_title(item.section, len(same)))
+            if prev is None:
+                print(header_line(detail_width))
+            prev = item.section
+        key = KEYS[i % len(KEYS)] if i < len(KEYS) else "."
+        print(paint(f"{key:<2}", "1;33") + render_row(item, False, detail_width))
+
+
+# --------------------------------------------------------------------------- main
+
+def collect_all():
+    sessions = collect_tmux() + collect_zellij()
+    sessions.sort(key=lambda it: (-it.created, it.tool, it.name))
+    dirs = collect_dirs()
+    return sessions + dirs
+
+
+def main():
+    args = sys.argv[1:]
+    items = collect_all()
+
+    non_interactive = (not sys.stdin.isatty()) or ("-l" in args or "--list" in args)
+    if non_interactive or not items:
+        if not items:
+            print("No sessions and no Claude Code / Codex project dirs found.")
+        else:
+            print_list(items)
+        return 0
+
+    search_loop(items)
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        sys.exit(130)
