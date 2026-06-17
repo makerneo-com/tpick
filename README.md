@@ -89,4 +89,4 @@ CODEX_SESSIONS  = os.path.join(HOME, ".codex", "sessions")
 
 ## License
 
-[MIT](./LICENSE) © n4eo
+[MIT](./LICENSE) © MakerNeo
